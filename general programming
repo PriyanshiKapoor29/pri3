@@ -1,0 +1,97 @@
+use clap::{App, Arg, SubCommand};
+use rusqlite::{Connection, Result};
+use std::env;
+use std::fs;
+use std::path::Path;
+use fuzzy_matcher::{fuzzy_match, skim::SkimMatcherV2};
+use fuzzy_matcher::FuzzyMatcher;
+use std::process::Command;
+
+fn main() -> Result<()> {
+    let matches = App::new("jumpy")
+        .version("0.1.0")
+        .author("Your Name")
+        .about("A fast directory jumper")
+        .arg(Arg::with_name("query").help("Directory query").index(1))
+        .get_matches();
+
+    let db_path = env::var("HOME").unwrap() + "/.jumpy.db";
+    let conn = Connection::open(&db_path)?;
+
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS directories (
+            path TEXT PRIMARY KEY,
+            count INTEGER DEFAULT 0
+        )",
+        [],
+    )?;
+
+    if let Some(query) = matches.value_of("query") {
+        jump(&conn, query)?;
+    } else {
+        // Handle no query (e.g., list frequent directories)
+        list_frequent(&conn)?;
+    }
+
+    Ok(())
+}
+
+fn jump(conn: &Connection, query: &str) -> Result<()> {
+    let current_dir = env::current_dir().unwrap();
+    let current_dir_str = current_dir.to_str().unwrap();
+
+    let mut stmt = conn.prepare("SELECT path, count FROM directories")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<usize, String>(0)?, row.get::<usize, i32>(1)?))
+    })?;
+
+    let matcher = SkimMatcherV2::default();
+    let mut matches: Vec<(i64, String)> = rows
+        .filter_map(|row| {
+            let (path, count) = row.unwrap();
+            if let Some(score) = matcher.fuzzy_match(&path, query) {
+                let current_dir_score = if path.starts_with(current_dir_str) {100} else {0};
+                Some(((score as i64 * count as i64) + current_dir_score, path))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    matches.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if let Some((_, path)) = matches.first() {
+        println!("cd \"{}\"", path); // Print the cd command
+        update_count(conn, path)?;
+    }
+
+    Ok(())
+}
+
+fn update_count(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO directories (path, count) VALUES (?, (SELECT count + 1 FROM directories WHERE path = ?))",
+        [path, path],
+    )?;
+    Ok(())
+}
+
+fn list_frequent(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT path, count FROM directories ORDER BY count DESC LIMIT 10")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<usize, String>(0)?, row.get::<usize, i32>(1)?))
+    })?;
+
+    for row in rows {
+        let (path, count) = row?;
+        println!("{}: {}", path, count);
+    }
+    Ok(())
+}
+
+//Function to run when a cd command is executed.
+fn track_cd(conn: &Connection, path: &str) -> Result<()> {
+    let abs_path = fs::canonicalize(Path::new(path))?.to_str().unwrap().to_string();
+    update_count(conn, &abs_path)?;
+    Ok(())
+}
